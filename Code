@@ -1,0 +1,168 @@
+import cv2
+import time
+import os
+import urllib.request
+import numpy as np
+import torch
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+from PIL import Image
+
+# ১. MediaPipe Setup
+model_path = 'hand_landmarker.task'
+if not os.path.exists(model_path):
+    print("Downloading hand_landmarker.task...")
+    url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    urllib.request.urlretrieve(url, model_path)
+
+base_options = python.BaseOptions(model_asset_path=model_path)
+options = vision.HandLandmarkerOptions(
+    base_options=base_options,
+    num_hands=1,
+    min_hand_detection_confidence=0.5,
+    min_hand_presence_confidence=0.5
+)
+detector = vision.HandLandmarker.create_from_options(options)
+
+# ২. SegFormer Setup
+print("Loading SegFormer Model...")
+model_id = "nvidia/segformer-b1-finetuned-ade-512-512"
+processor = SegformerImageProcessor.from_pretrained(model_id)
+model = SegformerForSemanticSegmentation.from_pretrained(model_id)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+model.eval()
+
+HAND_CONNECTIONS = [
+    (0,1), (1,2), (2,3), (3,4),
+    (0,5), (5,6), (6,7), (7,8),
+    (5,9), (9,10), (10,11), (11,12),
+    (9,13), (13,14), (14,15), (15,16),
+    (13,17), (0,17), (17,18), (18,19), (19,20)
+]
+
+cap = cv2.VideoCapture(0)
+
+styles = ["Oil Painting", "Neon Cyberpunk", "Anime/Cartoon", "Pop Art", "Pencil Sketch"]
+total_styles = len(styles)
+current_style_index = 0
+
+prev_x = None
+swipe_cooldown = 0
+last_segment_time = 0
+mask_overlay = None
+person_mask = None
+
+def apply_style(img, style_name):
+    if style_name == "Oil Painting":
+        return cv2.xphoto.oilPainting(img, 7, 1) if hasattr(cv2, 'xphoto') else cv2.stylization(img, sigma_s=60, sigma_r=0.4)
+    elif style_name == "Neon Cyberpunk":
+        img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        img_hsv[:, :, 0] = (img_hsv[:, :, 0] + 90) % 180  # Shift colors to Pink/Cyan
+        img_hsv[:, :, 1] = cv2.add(img_hsv[:, :, 1], 50)
+        neon = cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR)
+        return cv2.addWeighted(neon, 0.8, cv2.GaussianBlur(neon, (15, 15), 0), 0.2, 0)
+    elif style_name == "Anime/Cartoon":
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.medianBlur(gray, 5)
+        edges = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 9, 9)
+        color = cv2.bilateralFilter(img, 9, 300, 300)
+        return cv2.bitwise_and(color, color, mask=edges)
+    elif style_name == "Pop Art":
+        img_small = cv2.resize(img, (0,0), fx=0.5, fy=0.5)
+        quantized = (img_small // 64) * 64 + 32
+        return cv2.resize(quantized, (img.shape[1], img.shape[0]))
+    elif style_name == "Pencil Sketch":
+        gray, color_sketch = cv2.pencilSketch(img, sigma_s=60, sigma_r=0.07, shade_factor=0.05)
+        return color_sketch
+    return img
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    current_time = time.time()
+
+    # --- SegFormer Face & Body Region ---
+    if current_time - last_segment_time > 0.3:
+        try:
+            small_frame = cv2.resize(frame, (256, 256))
+            pil_img = Image.fromarray(cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB))
+            
+            inputs = processor(images=pil_img, return_tensors="pt").to(device)
+            with torch.no_grad():
+                outputs = model(**inputs)
+                logits = outputs.logits
+            
+            upsampled_logits = torch.nn.functional.interpolate(
+                logits, size=(h, w), mode="bilinear", align_corners=False
+            )
+            pred_seg = upsampled_logits.argmax(dim=1)[0].cpu().numpy()
+            person_mask = (pred_seg == 12) | (pred_seg == 1) # Person mask
+            last_segment_time = current_time
+        except Exception as e:
+            pass
+
+    current_style = styles[current_style_index]
+    styled_frame = apply_style(frame, current_style)
+
+    if person_mask is not None:
+        display_frame = frame.copy()
+        display_frame[person_mask] = styled_frame[person_mask]
+    else:
+        display_frame = styled_frame
+
+    # --- MediaPipe Gesture Engine ---
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    detection_result = detector.detect(mp_image)
+
+    if detection_result.hand_landmarks:
+        for hand_landmarks in detection_result.hand_landmarks:
+            points = []
+            for lm in hand_landmarks:
+                cx, cy = int(lm.x * w), int(lm.y * h)
+                points.append((cx, cy))
+                cv2.circle(display_frame, (cx, cy), 4, (0, 255, 0), -1)
+
+            for p1, p2 in HAND_CONNECTIONS:
+                cv2.line(display_frame, points[p1], points[p2], (255, 255, 255), 2)
+
+            index_tip_x, index_tip_y = points[8]
+            cv2.circle(display_frame, (index_tip_x, index_tip_y), 8, (0, 0, 255), -1)
+
+            
+            if prev_x is not None and current_time > swipe_cooldown:
+                dx = index_tip_x - prev_x
+                if dx > 70:
+                    current_style_index = (current_style_index + 1) % total_styles
+                    swipe_cooldown = current_time + 0.8
+                elif dx < -70:
+                    current_style_index = (current_style_index - 1) % total_styles
+                    swipe_cooldown = current_time + 0.8
+
+            prev_x = index_tip_x
+    else:
+        prev_x = None
+
+    # UI Header
+    cv2.rectangle(display_frame, (10, 10), (480, 70), (0, 0, 0), -1)
+    cv2.putText(
+        display_frame, 
+        f"Style: {styles[current_style_index]}", 
+        (20, 50), 
+        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2
+    )
+
+    cv2.imshow("Hand Gesture Neural Style Transfer", display_frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
